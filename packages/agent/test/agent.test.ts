@@ -1,6 +1,7 @@
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@mariozechner/pi-ai";
+import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { Agent } from "../src/index.js";
+import { Agent, type AgentEvent, type AgentTool, type AgentToolUpdateCallback } from "../src/index.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -36,6 +37,39 @@ function createAssistantMessage(text: string): AssistantMessage {
 	};
 }
 
+type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
+
+function createAssistantToolUseMessage(content: ToolCallContent[]): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: "openai-responses",
+		provider: "openai",
+		model: "mock",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
+}
+
+function createDeferred(): {
+	promise: Promise<void>;
+	resolve: () => void;
+} {
+	let resolve = () => {};
+	const promise = new Promise<void>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
 describe("Agent", () => {
 	it("should create an agent instance with default state", () => {
 		const agent = new Agent();
@@ -47,9 +81,9 @@ describe("Agent", () => {
 		expect(agent.state.tools).toEqual([]);
 		expect(agent.state.messages).toEqual([]);
 		expect(agent.state.isStreaming).toBe(false);
-		expect(agent.state.streamMessage).toBe(null);
+		expect(agent.state.streamingMessage).toBe(undefined);
 		expect(agent.state.pendingToolCalls).toEqual(new Set());
-		expect(agent.state.error).toBeUndefined();
+		expect(agent.state.errorMessage).toBeUndefined();
 	});
 
 	it("should create an agent instance with custom initial state", () => {
@@ -79,51 +113,335 @@ describe("Agent", () => {
 		expect(eventCount).toBe(0);
 
 		// State mutators don't emit events
-		agent.setSystemPrompt("Test prompt");
+		agent.state.systemPrompt = "Test prompt";
 		expect(eventCount).toBe(0);
 		expect(agent.state.systemPrompt).toBe("Test prompt");
 
 		// Unsubscribe should work
 		unsubscribe();
-		agent.setSystemPrompt("Another prompt");
+		agent.state.systemPrompt = "Another prompt";
 		expect(eventCount).toBe(0); // Should not increase
+	});
+
+	it("emits full lifecycle events for thrown run failures", async () => {
+		const agent = new Agent({
+			streamFn: () => {
+				throw new Error("provider exploded");
+			},
+		});
+		const events: string[] = [];
+		agent.subscribe((event) => {
+			events.push(event.type);
+		});
+
+		await agent.prompt("hello");
+
+		expect(events).toEqual([
+			"agent_start",
+			"turn_start",
+			"message_start",
+			"message_end",
+			"message_start",
+			"message_end",
+			"turn_end",
+			"agent_end",
+		]);
+		const lastMessage = agent.state.messages[agent.state.messages.length - 1];
+		expect(lastMessage?.role).toBe("assistant");
+		if (lastMessage?.role !== "assistant") throw new Error("Expected assistant message");
+		expect(lastMessage.stopReason).toBe("error");
+		expect(lastMessage.errorMessage).toBe("provider exploded");
+		expect(agent.state.errorMessage).toBe("provider exploded");
+	});
+
+	it("should await async subscribers before prompt resolves", async () => {
+		const barrier = createDeferred();
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+
+		let listenerFinished = false;
+		agent.subscribe(async (event) => {
+			if (event.type === "agent_end") {
+				await barrier.promise;
+				listenerFinished = true;
+			}
+		});
+
+		let promptResolved = false;
+		const promptPromise = agent.prompt("hello").then(() => {
+			promptResolved = true;
+		});
+
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(promptResolved).toBe(false);
+		expect(listenerFinished).toBe(false);
+		expect(agent.state.isStreaming).toBe(true);
+
+		barrier.resolve();
+		await promptPromise;
+
+		expect(listenerFinished).toBe(true);
+		expect(promptResolved).toBe(true);
+		expect(agent.state.isStreaming).toBe(false);
+	});
+
+	it("waitForIdle should wait for async subscribers", async () => {
+		const barrier = createDeferred();
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+
+		agent.subscribe(async (event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				await barrier.promise;
+			}
+		});
+
+		const promptPromise = agent.prompt("hello");
+		let idleResolved = false;
+		const idlePromise = agent.waitForIdle().then(() => {
+			idleResolved = true;
+		});
+
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(idleResolved).toBe(false);
+		expect(agent.state.isStreaming).toBe(true);
+
+		barrier.resolve();
+		await Promise.all([promptPromise, idlePromise]);
+
+		expect(idleResolved).toBe(true);
+		expect(agent.state.isStreaming).toBe(false);
+	});
+
+	it("should pass the active abort signal to subscribers", async () => {
+		let receivedSignal: AbortSignal | undefined;
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const checkAbort = () => {
+						if (options?.signal?.aborted) {
+							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+						} else {
+							setTimeout(checkAbort, 5);
+						}
+					};
+					checkAbort();
+				});
+				return stream;
+			},
+		});
+
+		agent.subscribe((event, signal) => {
+			if (event.type === "agent_start") {
+				receivedSignal = signal;
+			}
+		});
+
+		const promptPromise = agent.prompt("hello");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		expect(receivedSignal).toBeDefined();
+		expect(receivedSignal?.aborted).toBe(false);
+
+		agent.abort();
+		await promptPromise;
+
+		expect(receivedSignal?.aborted).toBe(true);
+	});
+
+	it("should ignore tool updates after the tool execution settles", async () => {
+		const toolSchema = Type.Object({});
+		let delayedUpdate: AgentToolUpdateCallback<{ status: string }> | undefined;
+		const events: AgentEvent[] = [];
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (error: unknown) => {
+			unhandledRejections.push(error);
+		};
+		const tool: AgentTool<typeof toolSchema, { status: string }> = {
+			name: "delayed_tool",
+			label: "Delayed Tool",
+			description: "Captures progress callbacks",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				delayedUpdate = onUpdate;
+				onUpdate?.({
+					content: [{ type: "text", text: "running" }],
+					details: { status: "running" },
+				});
+				return {
+					content: [{ type: "text", text: "ok" }],
+					details: { status: "done" },
+					terminate: true,
+				};
+			},
+		};
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantToolUseMessage([
+							{ type: "toolCall", id: "call-1", name: "delayed_tool", arguments: {} },
+						]),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		process.on("unhandledRejection", onUnhandledRejection);
+		try {
+			await agent.prompt("run tool");
+			const eventCountAfterPrompt = events.length;
+
+			delayedUpdate?.({
+				content: [{ type: "text", text: "late" }],
+				details: { status: "late" },
+			});
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(events.filter((event) => event.type === "tool_execution_update")).toHaveLength(1);
+			expect(events).toHaveLength(eventCountAfterPrompt);
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
+	it("should ignore a settled parallel tool update while another tool is still running", async () => {
+		const toolSchema = Type.Object({});
+		const slowStarted = createDeferred();
+		const settledToolEnded = createDeferred();
+		const releaseSlow = createDeferred();
+		let settledToolUpdate: AgentToolUpdateCallback<{ status: string }> | undefined;
+		const events: AgentEvent[] = [];
+		const settledTool: AgentTool<typeof toolSchema, { status: string }> = {
+			name: "settled_tool",
+			label: "Settled Tool",
+			description: "Captures progress callbacks",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				settledToolUpdate = onUpdate;
+				return {
+					content: [{ type: "text", text: "done" }],
+					details: { status: "done" },
+					terminate: true,
+				};
+			},
+		};
+		const slowTool: AgentTool<typeof toolSchema, { status: string }> = {
+			name: "slow_tool",
+			label: "Slow Tool",
+			description: "Keeps the agent run active",
+			parameters: toolSchema,
+			async execute() {
+				slowStarted.resolve();
+				await releaseSlow.promise;
+				return {
+					content: [{ type: "text", text: "done" }],
+					details: { status: "done" },
+					terminate: true,
+				};
+			},
+		};
+		const agent = new Agent({
+			initialState: { tools: [settledTool, slowTool] },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantToolUseMessage([
+							{ type: "toolCall", id: "call-1", name: "settled_tool", arguments: {} },
+							{ type: "toolCall", id: "call-2", name: "slow_tool", arguments: {} },
+						]),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+			if (event.type === "tool_execution_end" && event.toolCallId === "call-1") {
+				settledToolEnded.resolve();
+			}
+		});
+
+		const promptPromise = agent.prompt("run tools");
+		await Promise.all([slowStarted.promise, settledToolEnded.promise]);
+		const eventCountBeforeLateUpdate = events.length;
+
+		settledToolUpdate?.({
+			content: [{ type: "text", text: "late" }],
+			details: { status: "late" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(events).toHaveLength(eventCountBeforeLateUpdate);
+
+		releaseSlow.resolve();
+		await promptPromise;
+		expect(events.filter((event) => event.type === "tool_execution_update")).toHaveLength(0);
 	});
 
 	it("should update state with mutators", () => {
 		const agent = new Agent();
 
 		// Test setSystemPrompt
-		agent.setSystemPrompt("Custom prompt");
+		agent.state.systemPrompt = "Custom prompt";
 		expect(agent.state.systemPrompt).toBe("Custom prompt");
 
 		// Test setModel
 		const newModel = getModel("google", "gemini-2.5-flash");
-		agent.setModel(newModel);
+		agent.state.model = newModel;
 		expect(agent.state.model).toBe(newModel);
 
 		// Test setThinkingLevel
-		agent.setThinkingLevel("high");
+		agent.state.thinkingLevel = "high";
 		expect(agent.state.thinkingLevel).toBe("high");
 
 		// Test setTools
 		const tools = [{ name: "test", description: "test tool" } as any];
-		agent.setTools(tools);
-		expect(agent.state.tools).toBe(tools);
+		agent.state.tools = tools;
+		expect(agent.state.tools).toEqual(tools);
+		expect(agent.state.tools).not.toBe(tools); // Should be a copy
 
 		// Test replaceMessages
 		const messages = [{ role: "user" as const, content: "Hello", timestamp: Date.now() }];
-		agent.replaceMessages(messages);
+		agent.state.messages = messages;
 		expect(agent.state.messages).toEqual(messages);
 		expect(agent.state.messages).not.toBe(messages); // Should be a copy
 
 		// Test appendMessage
 		const newMessage = { role: "assistant" as const, content: [{ type: "text" as const, text: "Hi" }] };
-		agent.appendMessage(newMessage as any);
+		agent.state.messages.push(newMessage as any);
 		expect(agent.state.messages).toHaveLength(2);
 		expect(agent.state.messages[1]).toBe(newMessage);
 
 		// Test clearMessages
-		agent.clearMessages();
+		agent.state.messages = [];
 		expect(agent.state.messages).toEqual([]);
 	});
 
@@ -241,14 +559,14 @@ describe("Agent", () => {
 			},
 		});
 
-		agent.replaceMessages([
+		agent.state.messages = [
 			{
 				role: "user",
 				content: [{ type: "text", text: "Initial" }],
 				timestamp: Date.now() - 10,
 			},
 			createAssistantMessage("Initial response"),
-		]);
+		];
 
 		agent.followUp({
 			role: "user",
@@ -285,14 +603,14 @@ describe("Agent", () => {
 			},
 		});
 
-		agent.replaceMessages([
+		agent.state.messages = [
 			{
 				role: "user",
 				content: [{ type: "text", text: "Initial" }],
 				timestamp: Date.now() - 10,
 			},
 			createAssistantMessage("Initial response"),
-		]);
+		];
 
 		agent.steer({
 			role: "user",

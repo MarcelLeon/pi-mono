@@ -5,14 +5,16 @@
  *
  * Test with: npx tsx src/cli-new.ts [args...]
  */
-process.title = "pi";
+import { APP_NAME } from "./config.ts";
+import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { main } from "./main.ts";
 
-import { setBedrockProviderModule } from "@mariozechner/pi-ai";
-import { bedrockProviderModule } from "@mariozechner/pi-ai/bedrock-provider";
-import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { main } from "./main.js";
+process.title = APP_NAME;
+process.env.PI_CODING_AGENT = "true";
+process.emitWarning = (() => {}) as typeof process.emitWarning;
 
-setGlobalDispatcher(new EnvHttpProxyAgent());
-setBedrockProviderModule(bedrockProviderModule);
+// Configure undici's global dispatcher before provider SDKs issue requests.
+// Runtime settings are applied once SettingsManager has loaded global/project settings.
+configureHttpDispatcher();
 
 main(process.argv.slice(2));

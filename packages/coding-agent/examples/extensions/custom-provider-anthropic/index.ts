@@ -42,8 +42,8 @@ import {
 	type Tool,
 	type ToolCall,
 	type ToolResultMessage,
-} from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // =============================================================================
 // OAuth Implementation (copied from packages/ai/src/utils/oauth/anthropic.ts)
@@ -153,7 +153,7 @@ async function refreshAnthropicToken(credentials: OAuthCredentials): Promise<OAu
 }
 
 // =============================================================================
-// Streaming Implementation (simplified from packages/ai/src/providers/anthropic.ts)
+// Streaming Implementation (simplified from packages/ai/src/api/anthropic-messages.ts)
 // =============================================================================
 
 // Claude Code tool names for OAuth stealth mode
@@ -568,7 +568,7 @@ function streamCustomAnthropic(
 export default function (pi: ExtensionAPI) {
 	pi.registerProvider("custom-anthropic", {
 		baseUrl: "https://api.anthropic.com",
-		apiKey: "CUSTOM_ANTHROPIC_API_KEY",
+		apiKey: "$CUSTOM_ANTHROPIC_API_KEY",
 		api: "custom-anthropic-api",
 
 		models: [

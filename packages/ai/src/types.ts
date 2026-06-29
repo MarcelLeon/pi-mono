@@ -1,6 +1,16 @@
-import type { AssistantMessageEventStream } from "./utils/event-stream.js";
+import type { AnthropicOptions } from "./api/anthropic-messages.ts";
+import type { AzureOpenAIResponsesOptions } from "./api/azure-openai-responses.ts";
+import type { BedrockOptions } from "./api/bedrock-converse-stream.ts";
+import type { GoogleOptions } from "./api/google-generative-ai.ts";
+import type { GoogleVertexOptions } from "./api/google-vertex.ts";
+import type { MistralOptions } from "./api/mistral-conversations.ts";
+import type { OpenAICodexResponsesOptions } from "./api/openai-codex-responses.ts";
+import type { OpenAICompletionsOptions } from "./api/openai-completions.ts";
+import type { OpenAIResponsesOptions } from "./api/openai-responses.ts";
+import type { AssistantMessageDiagnostic } from "./utils/diagnostics.ts";
+import type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
-export type { AssistantMessageEventStream } from "./utils/event-stream.js";
+export type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
 export type KnownApi =
 	| "openai-completions"
@@ -11,21 +21,25 @@ export type KnownApi =
 	| "anthropic-messages"
 	| "bedrock-converse-stream"
 	| "google-generative-ai"
-	| "google-gemini-cli"
 	| "google-vertex";
 
 export type Api = KnownApi | (string & {});
 
+export type KnownImagesApi = "openrouter-images";
+
+export type ImagesApi = KnownImagesApi | (string & {});
+
 export type KnownProvider =
 	| "amazon-bedrock"
+	| "ant-ling"
 	| "anthropic"
 	| "google"
-	| "google-gemini-cli"
-	| "google-antigravity"
 	| "google-vertex"
 	| "openai"
 	| "azure-openai-responses"
 	| "openai-codex"
+	| "nvidia"
+	| "deepseek"
 	| "github-copilot"
 	| "xai"
 	| "groq"
@@ -33,16 +47,42 @@ export type KnownProvider =
 	| "openrouter"
 	| "vercel-ai-gateway"
 	| "zai"
+	| "zai-coding-cn"
 	| "mistral"
 	| "minimax"
 	| "minimax-cn"
+	| "moonshotai"
+	| "moonshotai-cn"
 	| "huggingface"
+	| "fireworks"
+	| "together"
 	| "opencode"
 	| "opencode-go"
-	| "kimi-coding";
-export type Provider = KnownProvider | string;
+	| "kimi-coding"
+	| "cloudflare-workers-ai"
+	| "cloudflare-ai-gateway"
+	| "xiaomi"
+	| "xiaomi-token-plan-cn"
+	| "xiaomi-token-plan-ams"
+	| "xiaomi-token-plan-sgp";
+export type ProviderId = KnownProvider | string;
+
+export type KnownImagesProvider = "openrouter";
+
+export type ImagesProviderId = KnownImagesProvider | string;
 
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ModelThinkingLevel = "off" | ThinkingLevel;
+export type ThinkingLevelMap = Partial<Record<ModelThinkingLevel, string | null>>;
+export type ChatTemplateKwargValue =
+	| string
+	| number
+	| boolean
+	| null
+	| {
+			$var: "thinking.enabled" | "thinking.effort";
+			omitWhenOff?: boolean;
+	  };
 
 /** Token budgets for each thinking level (token-based providers only) */
 export interface ThinkingBudgets {
@@ -55,7 +95,16 @@ export interface ThinkingBudgets {
 // Base options all providers share
 export type CacheRetention = "none" | "short" | "long";
 
-export type Transport = "sse" | "websocket" | "auto";
+export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
+
+/** Provider-scoped environment overrides. Values take precedence over process.env. */
+export type ProviderEnv = Record<string, string>;
+export type ProviderHeaders = Record<string, string | null>;
+
+export interface ProviderResponse {
+	status: number;
+	headers: Record<string, string>;
+}
 
 export interface StreamOptions {
 	temperature?: number;
@@ -84,11 +133,35 @@ export interface StreamOptions {
 	 */
 	onPayload?: (payload: unknown, model: Model<Api>) => unknown | undefined | Promise<unknown | undefined>;
 	/**
-	 * Optional custom HTTP headers to include in API requests.
-	 * Merged with provider defaults; can override default headers.
-	 * Not supported by all providers (e.g., AWS Bedrock uses SDK auth).
+	 * Optional callback invoked after an HTTP response is received and before
+	 * its body stream is consumed.
 	 */
-	headers?: Record<string, string>;
+	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
+	/**
+	 * Optional custom HTTP headers to include in API requests.
+	 * Merged with provider defaults; caller values override default headers.
+	 * On AWS Bedrock these are injected via a Smithy `build`-step middleware so
+	 * they are covered by SigV4 signing; reserved headers (`x-amz-*`,
+	 * `authorization`, `host`) are silently ignored to preserve SigV4 / bearer auth.
+	 * A null value suppresses a provider/API default header with the same name.
+	 */
+	headers?: ProviderHeaders;
+	/**
+	 * HTTP request timeout in milliseconds for providers/SDKs that support it.
+	 * For example, OpenAI and Anthropic SDK clients default to 10 minutes.
+	 */
+	timeoutMs?: number;
+	/**
+	 * WebSocket connect timeout in milliseconds for providers that support
+	 * WebSocket transports. This covers the connection/open handshake only;
+	 * stream idleness after connection uses timeoutMs.
+	 */
+	websocketConnectTimeoutMs?: number;
+	/**
+	 * Maximum retry attempts for providers/SDKs that support client-side retries.
+	 * For example, OpenAI and Anthropic SDK clients default to 2.
+	 */
+	maxRetries?: number;
 	/**
 	 * Maximum delay in milliseconds to wait for a retry when the server requests a long wait.
 	 * If the server's requested delay exceeds this value, the request fails immediately
@@ -103,9 +176,115 @@ export interface StreamOptions {
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.
 	 */
 	metadata?: Record<string, unknown>;
+	/**
+	 * Provider-scoped environment values. These take precedence over process.env for
+	 * provider configuration such as regional settings, endpoint placeholders, and
+	 * proxy variables.
+	 */
+	env?: ProviderEnv;
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
+
+/**
+ * Maps known APIs to their full provider-specific stream option types.
+ * Type-only imports from API implementation modules are erased at emit, so
+ * this is tree-shake safe.
+ */
+export interface ApiOptionsMap {
+	"anthropic-messages": AnthropicOptions;
+	"openai-completions": OpenAICompletionsOptions;
+	"openai-responses": OpenAIResponsesOptions;
+	"openai-codex-responses": OpenAICodexResponsesOptions;
+	"azure-openai-responses": AzureOpenAIResponsesOptions;
+	"google-generative-ai": GoogleOptions;
+	"google-vertex": GoogleVertexOptions;
+	"mistral-conversations": MistralOptions;
+	"bedrock-converse-stream": BedrockOptions;
+}
+
+/**
+ * Full stream options for an API. Known APIs resolve to their concrete option
+ * type; custom API strings fall back to the generic shape.
+ */
+export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMap
+	? ApiOptionsMap[TApi]
+	: StreamOptions & Record<string, unknown>;
+
+/**
+ * The uniform stream contract of an API implementation module: every module
+ * under `src/api/` exports exactly `stream` and `streamSimple`, so the module
+ * itself satisfies this interface. Lazy wrappers (`lazyApi()`) and provider
+ * factories pass these around as values. This is the untyped dispatch shape;
+ * per-API option typing lives on the implementation modules themselves and on
+ * `Provider.stream()` via `ApiStreamOptions`.
+ */
+export interface ProviderStreams {
+	stream(model: Model<Api>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
+	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+}
+
+/**
+ * The uniform contract of an image-generation API implementation module:
+ * every image API module under `src/api/` exports exactly `generateImages`,
+ * so the module itself satisfies this interface. Lazy wrappers and image
+ * provider factories pass these around as values.
+ */
+export interface ProviderImages {
+	generateImages(
+		model: ImagesModel<ImagesApi>,
+		context: ImagesContext,
+		options?: ImagesOptions,
+	): Promise<AssistantImages>;
+}
+
+export interface ImagesOptions {
+	signal?: AbortSignal;
+	apiKey?: string;
+	/**
+	 * Provider-scoped environment values. These take precedence over process.env for
+	 * provider configuration such as endpoint placeholders and proxy variables.
+	 */
+	env?: ProviderEnv;
+	/**
+	 * Optional callback for inspecting or replacing provider payloads before sending.
+	 * Return undefined to keep the payload unchanged.
+	 */
+	onPayload?: (payload: unknown, model: ImagesModel<ImagesApi>) => unknown | undefined | Promise<unknown | undefined>;
+	/**
+	 * Optional callback invoked after an HTTP response is received.
+	 */
+	onResponse?: (response: ProviderResponse, model: ImagesModel<ImagesApi>) => void | Promise<void>;
+	/**
+	 * Optional custom HTTP headers to include in API requests.
+	 * Merged with provider defaults; can override default headers.
+	 * A null value suppresses a provider/API default header with the same name.
+	 */
+	headers?: ProviderHeaders;
+	/**
+	 * HTTP request timeout in milliseconds for providers/SDKs that support it.
+	 */
+	timeoutMs?: number;
+	/**
+	 * Maximum retry attempts for providers/SDKs that support client-side retries.
+	 */
+	maxRetries?: number;
+	/**
+	 * Maximum delay in milliseconds to wait for a retry when the server requests a long wait.
+	 * If the server's requested delay exceeds this value, the request fails immediately
+	 * with an error containing the requested delay, allowing higher-level retry logic
+	 * to handle it with user visibility.
+	 * Default: 60000 (60 seconds). Set to 0 to disable the cap.
+	 */
+	maxRetryDelayMs?: number;
+	/**
+	 * Optional metadata to include in API requests.
+	 * Providers extract the fields they understand and ignore the rest.
+	 */
+	metadata?: Record<string, unknown>;
+}
+
+export type ProviderImagesOptions = ImagesOptions & Record<string, unknown>;
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
@@ -114,12 +293,25 @@ export interface SimpleStreamOptions extends StreamOptions {
 	thinkingBudgets?: ThinkingBudgets;
 }
 
-// Generic StreamFunction with typed options
+// Generic StreamFunction with typed options.
+//
+// Contract:
+// - Must return an AssistantMessageEventStream.
+// - Once invoked, request/model/runtime failures should be encoded in the
+//   returned stream, not thrown.
+// - Error termination must produce an AssistantMessage with stopReason
+//   "error" or "aborted" and errorMessage, emitted via the stream protocol.
 export type StreamFunction<TApi extends Api = Api, TOptions extends StreamOptions = StreamOptions> = (
 	model: Model<TApi>,
 	context: Context,
 	options?: TOptions,
 ) => AssistantMessageEventStream;
+
+export type ImagesFunction<TApi extends ImagesApi = ImagesApi, TOptions extends ImagesOptions = ImagesOptions> = (
+	model: ImagesModel<TApi>,
+	context: ImagesContext,
+	options?: TOptions,
+) => Promise<AssistantImages>;
 
 export interface TextSignatureV1 {
 	v: 1;
@@ -162,6 +354,14 @@ export interface Usage {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/** Subset of `cacheWrite` written with 1h retention. Only Anthropic reports this split. */
+	cacheWrite1h?: number;
+	/**
+	 * Reasoning/thinking tokens, when the provider reports them. This is a subset of
+	 * `output`: `output` already includes these tokens. Set to a number (possibly 0) by
+	 * providers that expose a reasoning breakdown; left undefined by providers that don't.
+	 */
+	reasoning?: number;
 	totalTokens: number;
 	cost: {
 		input: number;
@@ -184,8 +384,11 @@ export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
 	api: Api;
-	provider: Provider;
+	provider: ProviderId;
 	model: string;
+	responseModel?: string; // Concrete `chunk.model` when different from the requested `model` (e.g. OpenRouter `auto` -> `anthropic/...`)
+	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
@@ -204,7 +407,28 @@ export interface ToolResultMessage<TDetails = any> {
 
 export type Message = UserMessage | AssistantMessage | ToolResultMessage;
 
-import type { TSchema } from "@sinclair/typebox";
+export type ImagesInputContent = TextContent | ImageContent;
+export type ImagesOutputContent = TextContent | ImageContent;
+
+export interface ImagesContext {
+	input: ImagesInputContent[];
+}
+
+export type ImagesStopReason = "stop" | "error" | "aborted";
+
+export interface AssistantImages {
+	api: ImagesApi;
+	provider: ImagesProviderId;
+	model: string;
+	output: ImagesOutputContent[];
+	responseId?: string;
+	usage?: Usage;
+	stopReason: ImagesStopReason;
+	errorMessage?: string;
+	timestamp: number; // Unix timestamp in milliseconds
+}
+
+import type { TSchema } from "typebox";
 
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
@@ -218,6 +442,14 @@ export interface Context {
 	tools?: Tool[];
 }
 
+/**
+ * Event protocol for AssistantMessageEventStream.
+ *
+ * Streams should emit `start` before partial updates, then terminate with either:
+ * - `done` carrying the final successful AssistantMessage, or
+ * - `error` carrying the final AssistantMessage with stopReason "error" or "aborted"
+ *   and errorMessage.
+ */
 export type AssistantMessageEvent =
 	| { type: "start"; partial: AssistantMessage }
 	| { type: "text_start"; contentIndex: number; partial: AssistantMessage }
@@ -243,8 +475,6 @@ export interface OpenAICompletionsCompat {
 	supportsDeveloperRole?: boolean;
 	/** Whether the provider supports `reasoning_effort`. Default: auto-detected from URL. */
 	supportsReasoningEffort?: boolean;
-	/** Optional mapping from pi-ai reasoning levels to provider/model-specific `reasoning_effort` values. */
-	reasoningEffortMap?: Partial<Record<ThinkingLevel, string>>;
 	/** Whether the provider supports `stream_options: { include_usage: true }` for token usage in streaming responses. Default: true. */
 	supportsUsageInStreaming?: boolean;
 	/** Which field to use for max tokens. Default: auto-detected from URL. */
@@ -255,31 +485,169 @@ export interface OpenAICompletionsCompat {
 	requiresAssistantAfterToolResult?: boolean;
 	/** Whether thinking blocks must be converted to text blocks with <thinking> delimiters. Default: auto-detected from URL. */
 	requiresThinkingAsText?: boolean;
-	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "zai" uses thinking: { type: "enabled" }, "qwen" uses enable_thinking: boolean. Default: "openai". */
-	thinkingFormat?: "openai" | "zai" | "qwen";
-	/** OpenRouter-specific routing preferences. Only used when baseUrl points to OpenRouter. */
+	/** Whether all replayed assistant messages must include an empty reasoning_content field when reasoning is enabled. Default: auto-detected from URL. */
+	requiresReasoningContentOnAssistantMessages?: boolean;
+	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "deepseek" uses thinking: { type } plus reasoning_effort when supported, "together" uses reasoning: { enabled } plus reasoning_effort when supported, "zai" uses thinking: { type }, "qwen" uses top-level enable_thinking: boolean, "qwen-chat-template" uses chat_template_kwargs.enable_thinking and preserve_thinking, "chat-template" uses configurable chat_template_kwargs, "string-thinking" uses top-level thinking: string, and "ant-ling" uses reasoning: { effort } only when the mapped effort is non-null. Default: "openai". */
+	thinkingFormat?:
+		| "openai"
+		| "openrouter"
+		| "deepseek"
+		| "together"
+		| "zai"
+		| "qwen"
+		| "chat-template"
+		| "qwen-chat-template"
+		| "string-thinking"
+		| "ant-ling";
+	/** Kwargs to send as `chat_template_kwargs` when `thinkingFormat` is `chat-template`. Use `{ "$var": "thinking.enabled" }` or `{ "$var": "thinking.effort" }` for pi-controlled thinking values. */
+	chatTemplateKwargs?: Record<string, ChatTemplateKwargValue>;
+	/** OpenRouter-compatible routing preferences sent as the `provider` request field. */
 	openRouterRouting?: OpenRouterRouting;
 	/** Vercel AI Gateway routing preferences. Only used when baseUrl points to Vercel AI Gateway. */
 	vercelGatewayRouting?: VercelGatewayRouting;
+	/** Whether z.ai supports top-level `tool_stream: true` for streaming tool call deltas. Default: false. */
+	zaiToolStream?: boolean;
 	/** Whether the provider supports the `strict` field in tool definitions. Default: true. */
 	supportsStrictMode?: boolean;
+	/** Cache control convention for prompt caching. "anthropic" applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user/assistant text content. */
+	cacheControlFormat?: "anthropic";
+	/** Whether to send known session-affinity headers (`session_id`, `x-client-request-id`, `x-session-affinity`) from `options.sessionId` when caching is enabled. Default: false. */
+	sendSessionAffinityHeaders?: boolean;
+	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
+	supportsLongCacheRetention?: boolean;
 }
 
 /** Compatibility settings for OpenAI Responses APIs. */
 export interface OpenAIResponsesCompat {
-	// Reserved for future use
+	/** Whether the provider supports the `developer` role (vs `system`). Default: true. */
+	supportsDeveloperRole?: boolean;
+	/** Whether to send the OpenAI `session_id` cache-affinity header from `options.sessionId` when caching is enabled. Default: true. */
+	sendSessionIdHeader?: boolean;
+	/** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
+	supportsLongCacheRetention?: boolean;
+}
+
+/** Compatibility settings for Anthropic Messages-compatible APIs. */
+export interface AnthropicMessagesCompat {
+	/**
+	 * Whether the provider accepts per-tool `eager_input_streaming`.
+	 * When false, the Anthropic provider omits `tools[].eager_input_streaming`
+	 * and sends the legacy `fine-grained-tool-streaming-2025-05-14` beta header
+	 * for tool-enabled requests.
+	 * Default: true.
+	 */
+	supportsEagerToolInputStreaming?: boolean;
+	/** Whether the provider supports Anthropic long cache retention (`cache_control.ttl: "1h"`). Default: true. */
+	supportsLongCacheRetention?: boolean;
+	/**
+	 * Whether to send the `x-session-affinity` header from `options.sessionId`
+	 * when caching is enabled. Required for providers like Fireworks that use
+	 * session affinity for prompt cache routing (requests to the same replica
+	 * maximize cache hits).
+	 * Default: false.
+	 */
+	sendSessionAffinityHeaders?: boolean;
+	/**
+	 * Whether the provider supports Anthropic-style `cache_control` markers on
+	 * tool definitions. When false, `cache_control` is omitted from tool params.
+	 * Some Anthropic-compatible providers (e.g., Fireworks) do not support this
+	 * field on tools and may reject or ignore it.
+	 * Default: true.
+	 */
+	supportsCacheControlOnTools?: boolean;
+	/**
+	 * Whether the model accepts the Anthropic `temperature` request field.
+	 * Claude Opus 4.7+ rejects non-default temperature values.
+	 * Default: true.
+	 */
+	supportsTemperature?: boolean;
+	/**
+	 * Whether to force adaptive thinking (`thinking.type: "adaptive"` plus
+	 * `output_config.effort`) regardless of the model id. Built-in models that
+	 * require adaptive thinking set this in generated metadata. Custom
+	 * Anthropic-compatible providers can set this to `true` for any model whose
+	 * upstream requires the adaptive format. Set to `false` to
+	 * opt out on overridden built-in models.
+	 * Default: false.
+	 */
+	forceAdaptiveThinking?: boolean;
+	/** Whether to replay empty thinking signatures as `signature: ""` instead of converting thinking to text. Default: false. */
+	allowEmptySignature?: boolean;
 }
 
 /**
  * OpenRouter provider routing preferences.
  * Controls which upstream providers OpenRouter routes requests to.
- * @see https://openrouter.ai/docs/provider-routing
+ * Sent as the `provider` field in the OpenRouter API request body.
+ * @see https://openrouter.ai/docs/guides/routing/provider-selection
  */
 export interface OpenRouterRouting {
-	/** List of provider slugs to exclusively use for this request (e.g., ["amazon-bedrock", "anthropic"]). */
-	only?: string[];
-	/** List of provider slugs to try in order (e.g., ["anthropic", "openai"]). */
+	/** Whether to allow backup providers to serve requests. Default: true. */
+	allow_fallbacks?: boolean;
+	/** Whether to filter providers to only those that support all parameters in the request. Default: false. */
+	require_parameters?: boolean;
+	/** Data collection setting. "allow" (default): allow providers that may store/train on data. "deny": only use providers that don't collect user data. */
+	data_collection?: "deny" | "allow";
+	/** Whether to restrict routing to only ZDR (Zero Data Retention) endpoints. */
+	zdr?: boolean;
+	/** Whether to restrict routing to only models that allow text distillation. */
+	enforce_distillable_text?: boolean;
+	/** An ordered list of provider names/slugs to try in sequence, falling back to the next if unavailable. */
 	order?: string[];
+	/** List of provider names/slugs to exclusively allow for this request. */
+	only?: string[];
+	/** List of provider names/slugs to skip for this request. */
+	ignore?: string[];
+	/** A list of quantization levels to filter providers by (e.g., ["fp16", "bf16", "fp8", "fp6", "int8", "int4", "fp4", "fp32"]). */
+	quantizations?: string[];
+	/** Sorting strategy. Can be a string (e.g., "price", "throughput", "latency") or an object with `by` and `partition`. */
+	sort?:
+		| string
+		| {
+				/** The sorting metric: "price", "throughput", "latency". */
+				by?: string;
+				/** Partitioning strategy: "model" (default) or "none". */
+				partition?: string | null;
+		  };
+	/** Maximum price per million tokens (USD). */
+	max_price?: {
+		/** Price per million prompt tokens. */
+		prompt?: number | string;
+		/** Price per million completion tokens. */
+		completion?: number | string;
+		/** Price per image. */
+		image?: number | string;
+		/** Price per audio unit. */
+		audio?: number | string;
+		/** Price per request. */
+		request?: number | string;
+	};
+	/** Preferred minimum throughput (tokens/second). Can be a number (applies to p50) or an object with percentile-specific cutoffs. */
+	preferred_min_throughput?:
+		| number
+		| {
+				/** Minimum tokens/second at the 50th percentile. */
+				p50?: number;
+				/** Minimum tokens/second at the 75th percentile. */
+				p75?: number;
+				/** Minimum tokens/second at the 90th percentile. */
+				p90?: number;
+				/** Minimum tokens/second at the 99th percentile. */
+				p99?: number;
+		  };
+	/** Preferred maximum latency (seconds). Can be a number (applies to p50) or an object with percentile-specific cutoffs. */
+	preferred_max_latency?:
+		| number
+		| {
+				/** Maximum latency in seconds at the 50th percentile. */
+				p50?: number;
+				/** Maximum latency in seconds at the 75th percentile. */
+				p75?: number;
+				/** Maximum latency in seconds at the 90th percentile. */
+				p90?: number;
+				/** Maximum latency in seconds at the 99th percentile. */
+				p99?: number;
+		  };
 }
 
 /**
@@ -299,9 +667,14 @@ export interface Model<TApi extends Api> {
 	id: string;
 	name: string;
 	api: TApi;
-	provider: Provider;
+	provider: ProviderId;
 	baseUrl: string;
 	reasoning: boolean;
+	/**
+	 * Maps pi thinking levels to provider/model-specific values.
+	 * Missing keys use provider defaults. null marks a level as unsupported.
+	 */
+	thinkingLevelMap?: ThinkingLevelMap;
 	input: ("text" | "image")[];
 	cost: {
 		input: number; // $/million tokens
@@ -317,5 +690,14 @@ export interface Model<TApi extends Api> {
 		? OpenAICompletionsCompat
 		: TApi extends "openai-responses"
 			? OpenAIResponsesCompat
-			: never;
+			: TApi extends "anthropic-messages"
+				? AnthropicMessagesCompat
+				: never;
+}
+
+export interface ImagesModel<TApi extends ImagesApi>
+	extends Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" | "maxTokens" | "compat"> {
+	api: TApi;
+	provider: ImagesProviderId;
+	output: ("text" | "image")[];
 }
